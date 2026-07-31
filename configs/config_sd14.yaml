@@ -2,7 +2,7 @@ experiment_dir: "results/SERUM_sd14"
 
 # Dataset configuration
 dataset:
-  name: "Gustavosta/Stable-Diffusion-Prompts"
+  name: "/data2/fzx/SERUM/datasets/Stable-Diffusion-Prompts"
   train_split: 40000
   batch_size: 32
   img_start: 0
@@ -15,9 +15,9 @@ dataset:
 
 # Diffusion Model configuration
 diffusion:
-  stable_diffusion_model_id: "CompVis/stable-diffusion-v1-4"
+  stable_diffusion_model_id: "/data2/fzx/.cache/modelscope/AI-ModelScope/stable-diffusion-v1-4"
   torch_dtype: "float16"
-  device: "cuda"
+  device: "cuda:1"
 
   # Sampling configuration
   sampling:

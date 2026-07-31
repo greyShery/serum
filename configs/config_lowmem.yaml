@@ -1,33 +1,33 @@
-experiment_dir: "results/SERUM_sd30"
+experiment_dir: "results/SERUM_full_lowmem"
 
 # Dataset configuration
 dataset:
   name: "/data2/fzx/SERUM/datasets/Stable-Diffusion-Prompts"
-  train_split: 40000
-  batch_size: 32
+  train_split: 4000
+  batch_size: 4
   img_start: 0
   img_end: -1
-  
+
   paths:
-    generated_data_file: "data_sd30_gen.pt"
-    augmented_data_file: "data_sd30_aug.pt"
+    generated_data_file: "data_sd21_gen_lowmem.pt"
+    augmented_data_file: "data_sd21_aug_lowmem.pt"
     data_dir: "./datasets"
 
 # Diffusion Model configuration
 diffusion:
-  stable_diffusion_model_id: "/data2/fzx/.cache/modelscope/stabilityai/stable-diffusion-3-medium-diffusers"
+  stable_diffusion_model_id: "/data2/fzx/.cache/modelscope/stabilityai/stable-diffusion-2-1-base"
   torch_dtype: "float16"
   device: "cuda:1"
 
   # Sampling configuration
   sampling:
-    default_steps: 28
+    default_steps: 50
     cfg_scale: 7.5
 
 # Default shapes
 shapes:
   image_size: 512
-  latent_channels: 16
+  latent_channels: 4
   latent_height: 64
   latent_width: 64
 
@@ -40,20 +40,20 @@ watermark:
     norm_stride: 1
 
   buffer:
-    size: 15000
+    size: 1500
 
   model_dir: "models"
   score_model_file: "score_model.pt"
   watermark_file: "watermark.pt"
 
-# Training configuration 
+# Training configuration
 training:
-  train_batch_size: 32
-  watermark_batch_size: 32
-  aug_batch_size: 4
+  train_batch_size: 4
+  watermark_batch_size: 4
+  aug_batch_size: 2
   aug_temp: 1
-  
-  epochs: 50
+
+  epochs: 10
   full_eval_interval: -1
 
   checkpoint_dir: "checkpoints"
@@ -70,16 +70,16 @@ training:
     patience: 2
 
   visualization:
-    batch_size: 16
-    log_interval: 500
+    batch_size: 4
+    log_interval: 100
     image_cnt: 4
 
 evaluation:
-  quick_samples: 20
-  num_samples: 5000
-  fid_num_samples: 10000
+  quick_samples: 10
+  num_samples: 500
+  fid_num_samples: 500
 
-  batch_size: 32
+  batch_size: 4
   target_fpr: 0.01
   size: [512, 512]
   random_seed: 42

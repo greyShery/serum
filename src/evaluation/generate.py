@@ -5,6 +5,7 @@ import os
 import random
 import re
 import shutil
+import sys
 from collections import defaultdict
 from typing import Optional, List, Tuple
 
@@ -33,7 +34,12 @@ def generate(config: Config,
              positive_prompts_path: Optional[str] = None,
              negative_prompts_path: Optional[str] = None,
              force_reload: bool = False) -> Tuple[str, str]:
-    """Generate clean and watermarked images from positive and negative prompts."""
+    """Generate clean and watermarked images from positive and negative prompts.
+
+    Supports multi-GPU data-parallel via env vars set by `torchrun` (RANK/WORLD_SIZE/LOCAL_RANK).
+    Each rank generates a non-overlapping slice of the [start_idx, start_idx+num_samples/WS)
+    range using the global file index, so rank outputs do not collide.
+    """
     if num_samples is None:
         num_samples = config.evaluation.num_samples
     if batch_size is None:
@@ -64,18 +70,44 @@ def generate(config: Config,
 
     positive_prompts, negative_prompts = load_pos_neg_prompts(config, positive_prompts_path, negative_prompts_path)
 
+    # Multi-GPU data-parallel split (no-op when WORLD_SIZE=1)
+    rank = int(os.environ.get("RANK", "0"))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    if world_size > 1:
+        if torch.cuda.is_available() and torch.cuda.device_count() > local_rank:
+            torch.cuda.set_device(local_rank)
+        if rank >= world_size:
+            return clean_path, watermarked_path
+
+    # Per-rank slice of the global [start_idx, start_idx+num_samples) range
+    if num_samples % world_size != 0:
+        if rank == 0:
+            print(f"Warning: num_samples ({num_samples}) not divisible by world_size ({world_size}); "
+                  f"rank 0 will absorb the remainder.")
+    base_per_rank = num_samples // world_size
+    extra = num_samples % world_size
+    per_rank = base_per_rank + (extra if rank == 0 else 0)
+    rank_start = start_idx + rank * base_per_rank
+    rank_end = rank_start + per_rank
+
+    if rank == 0:
+        print(f"Multi-GPU generation: world_size={world_size}, ranks see "
+              f"start_idx={start_idx}, num_samples={num_samples}, "
+              f"per_rank={per_rank}, this_rank_slice=[{rank_start}, {rank_end})")
+
     # Calculate batches
-    q, r = divmod(num_samples, batch_size)
+    q, r = divmod(per_rank, batch_size)
     batches = [batch_size] * q + ([r] if r else [])
 
-    sample_idx_clean, sample_idx_watermarked = start_idx, start_idx  # Global sample counter
-    for batch_idx, batch_s in enumerate(tqdm(batches, desc="Generating batches")):
+    sample_idx_clean, sample_idx_watermarked = rank_start, rank_start  # Global sample counter
+    for batch_idx, batch_s in enumerate(tqdm(batches, desc=f"Generating batches (rank {rank}/{world_size})")):
         # Clean memory before each batch
         cleanup_cuda_memory()
 
         # Select specific prompts for this batch
         prompt_start = sample_idx_clean
-        prompt_end = min(prompt_start + batch_s, start_idx + num_samples)
+        prompt_end = min(prompt_start + batch_s, rank_end)
 
         batch_positive_prompts = positive_prompts[prompt_start:prompt_end]
         batch_negative_prompts = negative_prompts[prompt_start:prompt_end]
@@ -92,7 +124,7 @@ def generate(config: Config,
         # Convert samples to images
         clean_imgs = decode(samples).cpu()
 
-        # Save individual images
+        # Save individual images (global index, no collision across ranks)
         for i in range(batch_s):
             # Save clean image with resizing
             clean_img_path = os.path.join(clean_path, f"clean_{sample_idx_clean:06d}.png")
@@ -125,8 +157,15 @@ def generate(config: Config,
         del samples_w, watermarked_imgs, g_res, orig_noise
         cleanup_cuda_memory()
 
-    print(f"Generated {num_samples} clean and watermarked images.")
-
+    print(f"[rank {rank}] Generated {per_rank} clean and watermarked images into [{rank_start}, {rank_end}).")
+    # Only rank 0 should continue to scoring/augmentation (single-GPU steps);
+    # other ranks have done their share of generation and can exit cleanly so
+    # torchrun doesn't keep them around wasting GPU memory.
+    if world_size > 1 and rank != 0:
+        print(f"[rank {rank}] All generation done. Exiting (rank 0 will continue scoring).")
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(0)
     return clean_path, watermarked_path
 
 

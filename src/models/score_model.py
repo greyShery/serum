@@ -1,9 +1,8 @@
 """
-Watermark scoring and generation utilities.
+Watermark scoring model: a lightweight CNN binary classifier on VAE latent space.
 
-This module implements watermarking functionality for diffusion models,
-including score calculation, gradient-based guidance, and watermarked
-image generation using the LlamaVisionTransformer model.
+forward(x) -> raw logits [B, 1]
+predict(x) -> sigmoid probability [0, 1]
 """
 
 import glob
@@ -54,22 +53,28 @@ class WatermarkScoreModel(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass returning raw logits.
+
+        Returns:
+            Unscaled logits [B, 1] — do NOT apply sigmoid here.
+            Use predict() for probabilities.
+        """
         x = self.conv_layers(x)
         x = torch.flatten(x, 1)
         x = self.fc_layers(x)
+        return x  # raw logits, no sigmoid
 
-        return torch.sigmoid(x)
+    def predict(self, x: torch.Tensor) -> torch.Tensor:
+        """Return sigmoid probability in [0, 1]."""
+        return torch.sigmoid(self.forward(x))
 
     def save(self, filename: str = None, include_date: bool = True) -> str:
         """
-        Save the watermark model to disk.
-        
-        Args:
-            path: Base path for saving
-            include_date: Whether to append timestamp to filename
-            
+        Save model weights to disk.
+
         Returns:
-            Final path where model was saved
+            Final path where model was saved.
         """
         if filename is None:
             filename = self.config.watermark.score_model_file
@@ -91,15 +96,9 @@ class WatermarkScoreModel(nn.Module):
     def load(config: Config, filename: str = None) -> 'WatermarkScoreModel':
         """
         Load watermark model from disk.
-        
-        Args:
-            path: Path to saved model file
-            
-        Returns:
-            Loaded WatermarkScoreModel instance
-            
-        Raises:
-            FileNotFoundError: If model file doesn't exist
+
+        Returns a model whose forward() returns raw logits;
+        call predict(x) for probabilities.
         """
         if filename is None:
             filename = config.watermark.score_model_file

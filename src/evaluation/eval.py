@@ -83,7 +83,7 @@ class Evaluation:
         Returns:
             Watermark scores
         """
-        return self.score_model(x.float())
+        return self.score_model.predict(x.float())
 
     @torch.no_grad()
     def quick_eval(self,
@@ -783,7 +783,7 @@ def main() -> None:
     augment = Augment()
 
     if args.load_from_checkpoint:
-        from training import Trainer
+        from ..training import Trainer
         if args.checkpoint_path is not None:
             print(f"Loading models from specified checkpoint...")
             checkpoint_path = args.checkpoint_path

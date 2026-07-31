@@ -22,7 +22,7 @@ from tqdm import tqdm
 
 from .. import evaluation
 from ..data import Dataset, Augment
-from ..models import WatermarkScoreModel, ModelWrapper, DiffusionModel, Watermark, encode, decode, score_model, get_vae
+from ..models import WatermarkScoreModel, ModelWrapper, DiffusionModel, Watermark, encode, decode, get_vae
 from .aug_sampler import AugSampler
 from ..utils.config import Config
 from ..utils import im
@@ -92,9 +92,12 @@ class Trainer:
 
         flatten_tensors = lambda x: [b for a in x for b in a]
 
+        gen_data = flatten_tensors(self.data)
+        aug_data = flatten_tensors(self.data_aug)
+        min_len = min(len(gen_data), len(aug_data))
         tensor_ds = TensorDataset(
-            torch.stack(flatten_tensors(self.data)),
-            torch.stack(flatten_tensors(self.data_aug))
+            torch.stack(gen_data[:min_len]),
+            torch.stack(aug_data[:min_len])
         )
 
         self.dataloader = DataLoader(tensor_ds, batch_size=batch_size, shuffle=True, drop_last=True)
@@ -279,44 +282,67 @@ class Trainer:
             ]
             inputs = [t.to(self.device).float() for t in inputs]
 
-            sizes = [t.size(0) for t in inputs]  # sizes to split the output later
-            concat_in = torch.cat(inputs, dim=0)  # single concatenated batch
-            p_all = self.score_model(concat_in)  # single forward pass
+            sizes = [t.size(0) for t in inputs]
+            concat_in = torch.cat(inputs, dim=0)
+            logits_all = self.score_model(concat_in)
 
-            # split outputs back into respective predictions
-            p_images, p_aug, p_x1, p_x2, p_aug_images, p_aug_images_watermarked = torch.split(p_all, sizes, dim=0)
+            logits_images, logits_aug, logits_x1, logits_x2, \
+                logits_aug_images, logits_aug_images_watermarked = torch.split(logits_all, sizes, dim=0)
 
-            # Calculating augmentation mistakes
+            # Probabilities for aug_sampler mistake signals and accuracy metrics
+            p_aug_images_watermarked = torch.sigmoid(logits_aug_images_watermarked)
+            p_aug_images = torch.sigmoid(logits_aug_images)
+
+            # Calculating augmentation mistakes (using probs, not logits)
             mistakes = (p_aug_images_watermarked < 0.5).float().mean().item()
             mistakes2 = (p_aug_images > 0.5).float().mean().item()
 
-            # If a mistake was made in any of the batches, we update the probabilities accordingly
             self.aug_sampler.update(aug_idx, int((mistakes > 0) | (mistakes2 > 0)))
 
-            # === CREATE TARGET LABELS ===
-            ones = torch.ones_like(p_images)  # Target = 1 for watermarked images
-            zeros = torch.zeros_like(p_x1)  # Target = 0 for clean images
-            zeros_smaller = torch.zeros_like(p_aug_images)  # Target = 0 for clean customly augmented images
-            ones_smaller = torch.ones_like(p_aug_images_watermarked)
+            # === TARGET LABELS ===
+            ones = torch.ones_like(logits_images)
+            zeros = torch.zeros_like(logits_x1)
 
-            # === LOSS CALCULATION ===
-            # Binary cross-entropy loss for each image type
-            loss = (F.binary_cross_entropy(p_images, ones) +                          # Watermarked - 1
-                    F.binary_cross_entropy(p_aug, ones) +                             # Augmented watermarked - 1
-                    F.binary_cross_entropy(p_aug_images_watermarked, ones_smaller) +  # Watermarked custom augmentation - 1
-                    F.binary_cross_entropy(p_x1, zeros) +                             # Clean original - 0
-                    F.binary_cross_entropy(p_x2, zeros) +                             # Clean augmented - 0
-                    F.binary_cross_entropy(p_aug_images, zeros_smaller))              # Clean custom augmentation - 0
+            # === WEIGHTED LOSS with focal component ===
+            # Each term:  weight * focal(p, target)
+            # focal(p, y) = -y * (1-p)^gamma * log(p)  -  (1-y) * p^gamma * log(1-p)
+            # gamma=1 recovers standard BCEWithLogitsLoss.
+            gamma = getattr(self.config.training, 'focal_gamma', 1.0)
+            pos_w  = getattr(self.config.training, 'pos_weight', 1.25)   # watermark (positive) class weight
+            neg_w  = getattr(self.config.training, 'neg_weight', 1.0)   # clean (negative) class weight
+
+            def _focal_bce(logits, target_value, weight, gamma_):
+                # Auto-build target with same shape as logits (avoids shape-mismatch
+                # when different forward heads have different batch sizes).
+                target = torch.full_like(logits, target_value) 
+                p = torch.sigmoid(logits)
+                pt = torch.where(target > 0.5, p, 1 - p).clamp(min=1e-7, max=1 - 1e-7)
+                bce = F.binary_cross_entropy_with_logits(logits, target, reduction='none')
+                focal = bce * ((1 - pt) ** gamma_)
+                return (weight * focal).mean()
+
+            # Positive (watermarked) terms — label = 1
+            L_watermarked       = _focal_bce(logits_images,                  1.0, pos_w, gamma)
+            L_aug_watermarked   = _focal_bce(logits_aug,                    1.0, pos_w, gamma)
+            L_aug_wm_custom     = _focal_bce(logits_aug_images_watermarked, 1.0, pos_w, gamma)
+
+            # Negative (clean) terms — label = 0
+            L_clean             = _focal_bce(logits_x1,                     0.0, neg_w, gamma)
+            L_clean_aug         = _focal_bce(logits_x2,                     0.0, neg_w, gamma)
+            L_clean_custom      = _focal_bce(logits_aug_images,             0.0, neg_w, gamma)
+
+            # Full loss: positive terms weighted slightly higher to improve TPR
+            loss = (L_watermarked + L_aug_watermarked + L_aug_wm_custom +
+                    L_clean * 0.8 + L_clean_aug * 0.8 + L_clean_custom * 0.8)
 
             # === BACKWARD PASS ===
-            loss.backward()  # Compute gradients
-            self.optimizer.step()  # Update model parameters
-            self.optimizer.zero_grad()  # Clear gradients for next iteration
+            loss.backward()
+            self.optimizer.step()
+            self.optimizer.zero_grad()
 
             # === ACCURACY CALCULATION ===
-            # Measure how well the model classifies each type
-            acc_aug_imgs_w = (p_aug_images_watermarked > 0.5).float().mean()  # Watermarked augmented accuracy
-            acc_aug_imgs_nw = (p_aug_images < 0.5).float().mean()  # Clean augmented accuracy
+            acc_aug_imgs_w = (p_aug_images_watermarked > 0.5).float().mean()
+            acc_aug_imgs_nw = (p_aug_images < 0.5).float().mean()
 
             # Store metrics for this batch
             losses.append(loss.item())
@@ -330,14 +356,14 @@ class Trainer:
             if verbose and counter % log_interval == 0:
                 # Print running averages over recent batches
                 recent_loss = np.mean(losses[-log_interval:]) if len(losses) >= log_interval else np.mean(losses)
-                recent_acc_w = np.mean(acc_w[-log_interval:]) if len(acc_w) >= log_interval else np.mean(acc_w)
+                recent_acc_w  = np.mean(acc_w[-log_interval:])  if len(acc_w)  >= log_interval else np.mean(acc_w)
                 recent_acc_nw = np.mean(acc_nw[-log_interval:]) if len(acc_nw) >= log_interval else np.mean(acc_nw)
 
                 print(f"Batch {counter + 1}")
                 print(f'Loss: {recent_loss:.9f}')
                 print(f'Watermarked (augmented) Acc: {recent_acc_w:.9f}')
                 print(f'Non-Watermarked (augmented) Acc: {recent_acc_nw:.9f}')
-                print(f'Final probabilities: {self.aug_sampler.get_probs()}')
+                print(f'Final probs: {self.aug_sampler.get_probs()}')
 
             counter += 1
 
