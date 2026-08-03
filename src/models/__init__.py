@@ -6,12 +6,17 @@ and watermark scoring model.
 """
 
 from .diffusion import ModelWrapper, DiffusionModel
-from .score_model import WatermarkScoreModel
+from .score_model import (
+    WatermarkScoreModel,
+    PixelWatermarkScoreModel,
+    build_score_model,
+)
 from .vae import get_vae, encode, decode
 from .watermark import Watermark
 
 __all__ = [
-    'WatermarkScoreModel', 'Watermark',
+    'WatermarkScoreModel', 'PixelWatermarkScoreModel', 'build_score_model',
+    'Watermark',
     'ModelWrapper', 'DiffusionModel',
     'get_vae', 'encode', 'decode'
 ]

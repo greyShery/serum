@@ -22,7 +22,17 @@ from tqdm import tqdm
 
 from .. import evaluation
 from ..data import Dataset, Augment
-from ..models import WatermarkScoreModel, ModelWrapper, DiffusionModel, Watermark, encode, decode, get_vae
+from ..models import (
+    WatermarkScoreModel,
+    PixelWatermarkScoreModel,
+    build_score_model,
+    ModelWrapper,
+    DiffusionModel,
+    Watermark,
+    encode,
+    decode,
+    get_vae,
+)
 from .aug_sampler import AugSampler
 from ..utils.config import Config
 from ..utils import im
@@ -73,6 +83,15 @@ class Trainer:
         self.score_model = self.score_model.to(self.device).train().requires_grad_(True)
         self.watermark = self.watermark.to(self.device)
 
+        # Detector mode: 'latent' (4 x 64 x 64 — needs VAE) or 'pixel' (3 x 512 x 512).
+        self.detector_type = getattr(self.config.training, 'detector_type', 'latent').lower()
+        if self.detector_type not in ('latent', 'pixel'):
+            raise ValueError(
+                f"Unsupported detector_type: {self.detector_type!r}. "
+                "Expected 'latent' or 'pixel'."
+            )
+        print(f"Detector type: {self.detector_type}")
+
         # Create checkpoint directory
         os.makedirs(self.config.training.checkpoint_dir, exist_ok=True)
 
@@ -105,9 +124,17 @@ class Trainer:
 
     @torch.no_grad()
     def _prepare_watermark_loader(self, batch_size: int, watermark_batch_size: int, load_checkpoint: bool = True) -> None:
+        # Pixel-space images at 3 x 512 x 512 are ~48x larger than latent
+        # tensors (4 x 64 x 64). Caching ~15k of them as a single .pt would
+        # cost ~42 GB on disk, so we always regenerate on-the-fly in pixel mode.
+        if self.detector_type == 'pixel':
+            self._setup_pixel_watermark_loader(batch_size, watermark_batch_size)
+            return
+
         # Generate dataset filename based on configuration
         expected_size = (self.config.watermark.buffer.size // batch_size) * batch_size
-        dataset_filename = f"watermarked_dataset_{expected_size}_{self.config.watermark.grid.noise_mix_alpha}.pt"
+        suffix = 'pixel' if self.detector_type == 'pixel' else 'latent'
+        dataset_filename = f"watermarked_dataset_{expected_size}_{self.config.watermark.grid.noise_mix_alpha}_{suffix}.pt"
         dataset_path = os.path.join(self.config.training.checkpoint_dir, dataset_filename)
 
         # Check if dataset already exists and has correct size
@@ -157,13 +184,23 @@ class Trainer:
                 prompts=self.prompts
             ).float()
 
-            images_aug = encode(self.augment(decode(watermarked_images.half()).float()).half()).float()
+            if self.detector_type == 'pixel':
+                # Pixel detector: cache decoded images (3 x 512 x 512) directly.
+                # Skip the VAE encode/decode round-trip that the latent pipeline uses.
+                primary = decode(watermarked_images.half()).float()
+                # Augment the *pixel* images, then keep them in pixel space.
+                primary_aug = self.augment(primary, idx=self.aug_sampler.sample()).float()
+            else:
+                # Latent detector: keep the legacy latent encode/decode round-trip.
+                images_aug = encode(self.augment(decode(watermarked_images.half()).float()).half()).float()
+                primary = watermarked_images
+                primary_aug = images_aug
 
             # Store watermarked images for later use
-            batches_watermarked_images.append(watermarked_images.cpu())
-            batches_watermarked_aug.append(images_aug.cpu())
-            
-            del watermarked_images, images_aug, watermark_noise
+            batches_watermarked_images.append(primary.cpu())
+            batches_watermarked_aug.append(primary_aug.cpu())
+
+            del watermarked_images, primary, primary_aug, watermark_noise
             cleanup_cuda_memory()
 
         # Create dataset
@@ -176,7 +213,7 @@ class Trainer:
         print(f"Saving watermarked dataset to {dataset_path}")
         torch.save(dataset, dataset_path)
 
-        print(f"Generated {len(dataset)} watermarked images for training buffer")
+        print(f"Generated {len(dataset)} watermarked images for training buffer ({self.detector_type})")
 
         self.watermarked_loader = DataLoader(
             dataset,
@@ -189,8 +226,17 @@ class Trainer:
         self.watermarked_iter = iter(self.watermarked_loader)
         cleanup_cuda_memory()
 
-    def _get_watermarked_batch(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Get next batch from watermarked dataloader, resetting iterator if needed."""
+    def _get_watermarked_batch(self, aug_idx: Optional[int] = None,
+                                batch_size: Optional[int] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Get next batch from watermarked dataloader.
+
+        For the latent detector, batches are pre-computed and cached; for the
+        pixel detector, batches are generated on-the-fly per call (much cheaper
+        than caching 15k images at 3 x 512 x 512 on disk).
+        """
+        if self.detector_type == 'pixel':
+            return self._generate_pixel_watermarked_batch(batch_size, aug_idx)
+
         try:
             images, images_aug = next(self.watermarked_iter)
             return images.to(self.device), images_aug.to(self.device)
@@ -199,6 +245,43 @@ class Trainer:
             self.watermarked_iter = iter(self.watermarked_loader)
             images, images_aug = next(self.watermarked_iter)
             return images.to(self.device), images_aug.to(self.device)
+
+    @torch.no_grad()
+    def _generate_pixel_watermarked_batch(self, batch_size: int,
+                                          aug_idx: Optional[int]) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Build a single watermarked pixel batch on-the-fly.
+
+        Args:
+            batch_size: number of watermarked images to generate this step.
+            aug_idx: passed in from the caller so ``aug_sampler.sample()`` is
+                only called once per training step (the resulting index is used
+                both for the augmented wm-batch and the augmented clean-batch).
+        """
+        if aug_idx is None:
+            aug_idx = self.aug_sampler.sample()
+        wm_noise = self.watermark(batch_size, alpha=self.config.watermark.grid.noise_mix_alpha).half()
+        wm_latents = self.diffusion_model.generate_full(
+            batch_size=batch_size,
+            noise=wm_noise,
+            x_ts_ret=False,
+            prompts=self.prompts,
+        ).float()
+        wm_pixel = decode(wm_latents.half()).float().clamp(-1, 1)
+        wm_pixel_aug = self.augment(wm_pixel, idx=aug_idx).float().clamp(-1, 1)
+        del wm_noise, wm_latents
+        cleanup_cuda_memory()
+        return wm_pixel, wm_pixel_aug
+
+    @torch.no_grad()
+    def _setup_pixel_watermark_loader(self, batch_size: int, watermark_batch_size: int) -> None:
+        """No-op for the pixel loader: batches are streamed lazily.
+
+        We still set ``self.watermarked_iter`` so older code paths that test
+        ``hasattr(self, 'watermarked_iter')`` keep working.
+        """
+        self.watermarked_loader = None
+        self.watermarked_iter = None
+        print(f"Pixel loader is streaming on-the-fly (no cache): {self.detector_type}")
 
     def _prepare_optimizer(self) -> None:
         # Initialize training optimizer
@@ -248,28 +331,54 @@ class Trainer:
 
         counter = 0
         # Iterate through batches of clean training data
-        # x1, x2 are both clean images (original and augmented versions)
+        # x1, x2 are both clean images (original and augmented versions).
+        # For the latent detector they are 4 x 64 x 64 latents; for the pixel
+        # detector they are decoded to 3 x 512 x 512 images here, once per batch,
+        # so the 6 forward heads never have to round-trip through VAE.
         for x1, x2 in tqdm(self.dataloader):
             # Move clean data to device
             x1 = x1.to(self.device).float()  # Clean images (original)
             x2 = x2.to(self.device).float()  # Clean images (augmented)
 
+            if self.detector_type == 'pixel':
+                x1 = decode(x1.half()).float()
+                x2 = decode(x2.half()).float()
+                x1 = x1.clamp(-1, 1)
+                x2 = x2.clamp(-1, 1)
+
             aug_idx = self.aug_sampler.sample()
 
-            # Get watermarked images from dataloader
-            watermarked_images, watermarked_images_aug = self._get_watermarked_batch()
+            # Get watermarked images from dataloader.
+            # In pixel mode this generates a fresh batch on-the-fly (avoids
+            # caching 15k images at 3 x 512 x 512 = ~42 GB on disk).
+            wm_batch_size = min(self.config.training.aug_batch_size * 4,
+                                self.config.training.watermark_batch_size)
+            watermarked_images, watermarked_images_aug = self._get_watermarked_batch(
+                aug_idx=aug_idx, batch_size=wm_batch_size,
+            )
 
-            aug_images = encode(
-                self.augment(decode(x1[:self.config.training.aug_batch_size, ].half()).float(), idx=aug_idx).half()
-            ).float()
+            aug_batch = self.config.training.aug_batch_size
 
-            # Create augmented versions of watermarked images
-            # This tests the model's robustness to image transformations
-            # Pipeline: watermarked latents - decode to pixels - augment - encode back to latents
-            aug_images_watermarked = encode(
-                self.augment(decode(watermarked_images[:self.config.training.aug_batch_size, ].half()).float(),
-                             idx=aug_idx).half()
-            ).float()
+            if self.detector_type == 'pixel':
+                # Pixel detector: skip the latent encode/decode hop completely.
+                aug_images = self.augment(
+                    x1[:aug_batch].float(), idx=aug_idx
+                ).float().clamp(-1, 1)
+                aug_images_watermarked = self.augment(
+                    watermarked_images[:aug_batch].float(), idx=aug_idx
+                ).float().clamp(-1, 1)
+            else:
+                # Latent detector: keep the original round-trip pipeline.
+                aug_images = encode(
+                    self.augment(decode(x1[:aug_batch, ].half()).float(), idx=aug_idx).half()
+                ).float()
+                # Create augmented versions of watermarked images
+                # This tests the model's robustness to image transformations
+                # Pipeline: watermarked latents - decode to pixels - augment - encode back to latents
+                aug_images_watermarked = encode(
+                    self.augment(decode(watermarked_images[:aug_batch, ].half()).float(),
+                                 idx=aug_idx).half()
+                ).float()
 
             # === FORWARD PASS: Get model predictions on different image types ===
             inputs = [
@@ -293,11 +402,9 @@ class Trainer:
             p_aug_images_watermarked = torch.sigmoid(logits_aug_images_watermarked)
             p_aug_images = torch.sigmoid(logits_aug_images)
 
-            # Calculating augmentation mistakes (using probs, not logits)
-            mistakes = (p_aug_images_watermarked < 0.5).float().mean().item()
-            mistakes2 = (p_aug_images > 0.5).float().mean().item()
-
-            self.aug_sampler.update(aug_idx, int((mistakes > 0) | (mistakes2 > 0)))
+            # === ACCURACY CALCULATION ===
+            acc_aug_imgs_w = (p_aug_images_watermarked > 0.5).float().mean()
+            acc_aug_imgs_nw = (p_aug_images < 0.5).float().mean()
 
             # === TARGET LABELS ===
             ones = torch.ones_like(logits_images)
@@ -314,13 +421,16 @@ class Trainer:
             def _focal_bce(logits, target_value, weight, gamma_):
                 # Auto-build target with same shape as logits (avoids shape-mismatch
                 # when different forward heads have different batch sizes).
-                target = torch.full_like(logits, target_value) 
+                target = torch.full_like(logits, target_value)
                 p = torch.sigmoid(logits)
                 pt = torch.where(target > 0.5, p, 1 - p).clamp(min=1e-7, max=1 - 1e-7)
                 bce = F.binary_cross_entropy_with_logits(logits, target, reduction='none')
                 focal = bce * ((1 - pt) ** gamma_)
                 return (weight * focal).mean()
 
+            # ----------------------------------------------------------------
+            # 创新点 1 (NovAUG-on): 6 路 focal loss (原始 SERUM 损失)
+            # ----------------------------------------------------------------
             # Positive (watermarked) terms — label = 1
             L_watermarked       = _focal_bce(logits_images,                  1.0, pos_w, gamma)
             L_aug_watermarked   = _focal_bce(logits_aug,                    1.0, pos_w, gamma)
@@ -331,9 +441,77 @@ class Trainer:
             L_clean_aug         = _focal_bce(logits_x2,                     0.0, neg_w, gamma)
             L_clean_custom      = _focal_bce(logits_aug_images,             0.0, neg_w, gamma)
 
-            # Full loss: positive terms weighted slightly higher to improve TPR
-            loss = (L_watermarked + L_aug_watermarked + L_aug_wm_custom +
-                    L_clean * 0.8 + L_clean_aug * 0.8 + L_clean_custom * 0.8)
+            loss_cls = (L_watermarked + L_aug_watermarked + L_aug_wm_custom +
+                        L_clean * 0.8 + L_clean_aug * 0.8 + L_clean_custom * 0.8)
+
+            # ----------------------------------------------------------------
+            # 创新点 2 (NovCONS-IST): Augmentation consistency regularizer
+            #   文章 idea: 同一 prompt 的水印图在 (clean aug) 前后，detector 分数应保持一致
+            #   依据: SIDE_BY_SIDE.md §4.3 (mistake-as-signal) +  LDM 隐式 augment
+            # ----------------------------------------------------------------
+            loss_cons = logits_all.new_tensor(0.0)
+            if getattr(self.config.training, 'use_consistency', True):
+                w_cons = getattr(self.config.training, 'consistency_weight', 0.1)
+                # 水印图 clean vs aug 的一致性（logits 层面 MSE）
+                loss_cons_w = F.mse_loss(
+                    logits_aug_images_watermarked.view(-1),
+                    logits_images[:logits_aug_images_watermarked.shape[0]].view(-1),
+                )
+                # 干净图 clean vs aug 的一致性
+                loss_cons_c = F.mse_loss(
+                    logits_aug_images.view(-1),
+                    logits_x1[:logits_aug_images.shape[0]].view(-1),
+                )
+                loss_cons = w_cons * (loss_cons_w + loss_cons_c)
+
+            # ----------------------------------------------------------------
+            # 创新点 3 (NovMARGIN): Margin-based contrastive loss (HiDDeN 2018 灵感)
+            #   让 watermark logits 与 clean logits 至少隔开 margin 的距离
+            #   依据: HiDDeN 论文 Eq.4 (margin ranking) + SERUM §3.2 latent-space detection
+            # ----------------------------------------------------------------
+            loss_margin = logits_all.new_tensor(0.0)
+            if getattr(self.config.training, 'use_margin', True):
+                w_margin = getattr(self.config.training, 'margin_weight', 0.05)
+                margin = getattr(self.config.training, 'margin_value', 2.0)
+                # 配对 logits (取较小 batch 大小)
+                n = min(logits_images.shape[0], logits_x1.shape[0])
+                pos_logits = logits_images[:n].view(-1)
+                neg_logits = logits_x1[:n].view(-1)
+                # hinge: max(0, margin - (pos - neg))
+                loss_margin = w_margin * F.relu(
+                    margin - (pos_logits - neg_logits)
+                ).mean()
+
+            # ----------------------------------------------------------------
+            # 创新点 4 (NovALPHA): KL/alpha regularization (Appendix B 解析)
+            #   论文 Appendix B: KL(η' || η) ∝ α² 而不依赖于 grid 具体值
+            #   轻微正则化 alpha, 防止数值走偏
+            # ----------------------------------------------------------------
+            loss_alpha = logits_all.new_tensor(0.0)
+            if getattr(self.config.training, 'use_alpha_reg', True):
+                w_alpha = getattr(self.config.training, 'alpha_reg_weight', 1e-4)
+                alpha = self.config.watermark.grid.noise_mix_alpha
+                # 软限制 α ∈ [0.3, 0.7]（alpha 是 Python float,需转 tensor）
+                alpha_t = logits_all.new_tensor(float(alpha))
+                loss_alpha = w_alpha * (
+                    F.relu(0.3 - alpha_t) + F.relu(alpha_t - 0.7)
+                )
+
+            # ----------------------------------------------------------------
+            # 创新点 5 (NovPER): TD-error-style priority for miss 反馈
+            #   原文: aug_sampler 使用二元 mistake  -> 换成连续错误率
+            #   依据: PER_Schaul2016 论文, mistake-as-signal 多任务思想
+            # ----------------------------------------------------------------
+            p_aug_images_watermarked = torch.sigmoid(logits_aug_images_watermarked)
+            p_aug_images = torch.sigmoid(logits_aug_images)
+            # 连续 优先级 (0~1), 适中错误率才"学"
+            td_error_w = (0.5 - p_aug_images_watermarked).abs().mean().item()
+            td_error_c = (p_aug_images - 0.5).abs().mean().item()
+            td_error = max(td_error_w, td_error_c)
+            self.aug_sampler.update(aug_idx, td_error > 0.1)
+
+            # === TOTAL LOSS ===
+            loss = loss_cls + loss_cons + loss_margin + loss_alpha
 
             # === BACKWARD PASS ===
             loss.backward()
@@ -363,6 +541,9 @@ class Trainer:
                 print(f'Loss: {recent_loss:.9f}')
                 print(f'Watermarked (augmented) Acc: {recent_acc_w:.9f}')
                 print(f'Non-Watermarked (augmented) Acc: {recent_acc_nw:.9f}')
+                print(f'  - cls={loss_cls.item():.6f}  cons={loss_cons.item():.6f}  '
+                      f'margin={loss_margin.item():.6f}  alpha={loss_alpha.item():.6f}  '
+                      f'td_err={td_error:.4f}')
                 print(f'Final probs: {self.aug_sampler.get_probs()}')
 
             counter += 1
