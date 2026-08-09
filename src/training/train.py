@@ -100,6 +100,51 @@ class Trainer:
         if torch.cuda.is_available():
             torch.cuda.manual_seed(self.config.training.random_seed)
 
+        # === [创新点 #6: EMA Target Network] ===
+        #   维护 score_model 的 EMA 副本 (decay=0.999)
+        #   eval/checkpoint 使用 EMA 模型 (更稳定, AUC 通常 +1~3%)
+        #   BYOL / SimSiam / MoCo 经典做法
+        self.use_ema = bool(getattr(self.config.training, 'use_ema', False))
+        if self.use_ema:
+            import copy as _copy
+            self.ema_decay = float(getattr(self.config.training, 'ema_decay', 0.999))
+            self.ema_score_model = _copy.deepcopy(self.score_model).to(self.device).eval()
+            for p in self.ema_score_model.parameters():
+                p.requires_grad_(False)
+            print(f"[EMA] Enabled with decay={self.ema_decay}")
+        else:
+            self.ema_score_model = None
+            print("[EMA] Disabled (using live score_model for eval)")
+
+    def _ema_update(self) -> None:
+        """In-place EMA update of self.ema_score_model parameters from self.score_model."""
+        if not self.use_ema or self.ema_score_model is None:
+            return
+        d = self.ema_decay
+        with torch.no_grad():
+            for ep, p in zip(self.ema_score_model.parameters(), self.score_model.parameters()):
+                ep.data.mul_(d).add_(p.data, alpha=1.0 - d)
+            # Also copy buffers (e.g. BN running stats) — only if model has buffers
+            for eb, b in zip(self.ema_score_model.buffers(), self.score_model.buffers()):
+                eb.data.copy_(b.data)
+
+    def _swap_to_ema(self) -> None:
+        """Temporarily swap live score_model state with EMA state (in-place dict swap).
+        Returns a context-manager-style helper but we do manual swap for simplicity.
+        Use: backup = self._swap_to_ema(); ... ; self._restore_from_swap(backup)
+        """
+        if not self.use_ema or self.ema_score_model is None:
+            return None
+        backup = {k: v.detach().clone() for k, v in self.score_model.state_dict().items()}
+        ema_state = {k: v.detach().clone() for k, v in self.ema_score_model.state_dict().items()}
+        self.score_model.load_state_dict(ema_state)
+        return backup
+
+    def _restore_from_swap(self, backup) -> None:
+        if backup is None:
+            return
+        self.score_model.load_state_dict(backup)
+
     def _prepare_dataloader(self, batch_size: int) -> None:
         """
         Prepare the data loader for training.
@@ -567,6 +612,10 @@ class Trainer:
             self.optimizer.step()
             self.optimizer.zero_grad()
 
+            # === [创新点 #6] EMA target network update ===
+            #   在每个 step 之后用 EMA 滑动更新 ema_score_model
+            self._ema_update()
+
             # === ACCURACY CALCULATION ===
             acc_aug_imgs_w = (p_aug_images_watermarked > 0.5).float().mean()
             acc_aug_imgs_nw = (p_aug_images < 0.5).float().mean()
@@ -601,6 +650,9 @@ class Trainer:
         self.scheduler.step(np.mean(losses))
 
         # === VALIDATION ON TEST SET ===
+        # === [创新点 #6] Eval 时用 EMA 模型 (TPR 通常 +1~3%) ===
+        backup_state = self._swap_to_ema()
+
         # Set models to eval mode for validation
         self.score_model.eval()
         self.watermark.eval()
@@ -613,6 +665,9 @@ class Trainer:
         print(f"Epoch non-watermark accs: {np.mean(acc_nw)}")
 
         print(f'Final probabilities: {self.aug_sampler.get_probs()}')
+
+        # === [创新点 #6] 恢复 live score_model (训练需要 live 参数) ===
+        self._restore_from_swap(backup_state)
 
         return losses
 
@@ -693,6 +748,13 @@ class Trainer:
 
             self.save_checkpoint(epoch + 1)
 
+        # === [创新点 #6] 训练结束：把 EMA 权重 swap 回 live model，使 saved models/score_model.pt 是 EMA 版 ===
+        if self.use_ema and self.ema_score_model is not None:
+            print("\n[EMA] Swapping EMA weights into live score_model for final save...")
+            backup = self._swap_to_ema()
+            # Now self.score_model holds EMA weights — will be saved by train.py main()
+            # We don't restore here because train.py main() saves score_model.state_dict() right after
+
         return epoch_losses
 
     def save_checkpoint(self, epoch: int) -> None:
@@ -710,6 +772,12 @@ class Trainer:
             'scheduler_state_dict': self.scheduler.state_dict(),
             'random_state': torch.get_rng_state().byte()
         }
+
+        # === [创新点 #6] 保存 EMA 权重 ===
+        if self.use_ema and self.ema_score_model is not None:
+            checkpoint['ema_score_model_state_dict'] = self.ema_score_model.state_dict()
+            checkpoint['ema_decay'] = self.ema_decay
+            checkpoint['use_ema'] = True
 
         if torch.cuda.is_available():
             # Save the random state for the specific device being used
@@ -748,6 +816,13 @@ class Trainer:
         # Load model states
         self.score_model.load_state_dict(checkpoint['score_model_state_dict'])
         self.watermark.load_state_dict(checkpoint['watermark_state_dict'])
+
+        # === [创新点 #6] 加载 EMA 权重 ===
+        if self.use_ema and 'ema_score_model_state_dict' in checkpoint:
+            self.ema_score_model.load_state_dict(checkpoint['ema_score_model_state_dict'])
+            print(f"[EMA] Restored EMA target network (decay={checkpoint.get('ema_decay', self.ema_decay)})")
+        elif self.use_ema:
+            print("[EMA] No EMA weights in checkpoint — keeping initial EMA = current score_model")
 
         print("Model states restored from checkpoint")
 
@@ -863,6 +938,13 @@ class Trainer:
 
         score_model.load_state_dict(checkpoint['score_model_state_dict'])
         watermark.load_state_dict(checkpoint['watermark_state_dict'])
+
+        # === [创新点 #6] 如果 checkpoint 里有 EMA 权重, 优先用 EMA ===
+        #   (训练最后一步会把 EMA swap 到 live, 所以这里通常已经一致;
+        #    但如果从中间 epoch 恢复, EMA 仍是早期均值, 这里优先用)
+        if 'ema_score_model_state_dict' in checkpoint:
+            score_model.load_state_dict(checkpoint['ema_score_model_state_dict'])
+            print("[EMA] Using EMA target weights from checkpoint for eval")
 
         return score_model, watermark
 
