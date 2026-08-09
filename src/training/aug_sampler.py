@@ -82,24 +82,32 @@ class AugSampler:
         probs = probs / probs.sum()
         return probs
 
-    def update(self, idx: int, mistake: bool) -> None:
+    def update(self, idx: int, td_error: float) -> None:
         """
         Update probability for a specific augmentation based on model performance.
-        
+
         Args:
             idx: Index of the augmentation to update
-            mistake: Whether the model made a mistake on this augmentation
+            td_error: Continuous TD-error-style signal in [0, 0.5].
+                      0 = perfect prediction, 0.5 = random prediction.
+                      Internally normalized to [0, 1] for boost scaling.
         """
-        if mistake:
-            # Increase probability when model makes mistakes (focus on harder augmentations)
-            adapt = (1.0 - self.p[idx]) ** self.beta
-            lr = self.base_lr_pos * (1.0 + self.boost * adapt)
-            self.p[idx] = self.p[idx] + lr * (1.0 - self.p[idx])
-        else:
-            # Decrease probability when model performs well (reduce focus on easier augmentations)
-            adapt = (self.p[idx]) ** self.beta
-            lr = self.base_lr_neg * (1.0 + self.boost * adapt)
-            self.p[idx] = self.p[idx] - lr * (self.p[idx])
-        
+        # Normalize td_error ∈ [0, 0.5] -> [0, 1]
+        norm = float(min(1.0, max(0.0, float(td_error) * 2.0)))
+
+        # Difficulty-weighted increase: only push up when sample is hard.
+        # When norm == 0 (perfect prediction), lr_pos == 0, no push-up.
+        # When norm == 1 (random), lr_pos = base_lr_pos * (1 + boost) * adapt.
+        adapt = (1.0 - self.p[idx]) ** self.beta
+        lr_pos = self.base_lr_pos * norm * (1.0 + self.boost * adapt)
+        self.p[idx] = self.p[idx] + lr_pos * (1.0 - self.p[idx])
+
+        # Difficulty-weighted decrease: push down when sample is easy.
+        # When norm == 0 (easy), lr_neg = base_lr_neg * adapt_neg, full push-down.
+        # When norm == 1 (hard), lr_neg == 0, no push-down.
+        adapt_neg = (self.p[idx]) ** self.beta
+        lr_neg = self.base_lr_neg * (1.0 - norm) * adapt_neg
+        self.p[idx] = self.p[idx] - lr_neg * self.p[idx]
+
         # Clamp probability to prevent extreme values
         self.p[idx] = np.clip(self.p[idx], self.eps, 1.0 - self.eps)

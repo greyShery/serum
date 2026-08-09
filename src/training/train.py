@@ -132,9 +132,16 @@ class Trainer:
             return
 
         # Generate dataset filename based on configuration
+        #   默认 (固定 α)：    watermarked_dataset_{N}_{alpha}_latent.pt
+        #   创新点 #1 (自适应 α): watermarked_dataset_{N}_adaptive_latent.pt
+        #   注：自适应 α 模式下, 文件名不嵌 α — 因为 α 是 per-sample 的
+        use_adaptive = bool(getattr(self.config.watermark, 'adaptive_alpha', False))
         expected_size = (self.config.watermark.buffer.size // batch_size) * batch_size
         suffix = 'pixel' if self.detector_type == 'pixel' else 'latent'
-        dataset_filename = f"watermarked_dataset_{expected_size}_{self.config.watermark.grid.noise_mix_alpha}_{suffix}.pt"
+        if use_adaptive:
+            dataset_filename = f"watermarked_dataset_{expected_size}_adaptive_{suffix}.pt"
+        else:
+            dataset_filename = f"watermarked_dataset_{expected_size}_{self.config.watermark.grid.noise_mix_alpha}_{suffix}.pt"
         dataset_path = os.path.join(self.config.training.checkpoint_dir, dataset_filename)
 
         # Check if dataset already exists and has correct size
@@ -170,19 +177,59 @@ class Trainer:
 
         # Calculate how many full batches we can fit in buffer.size
         num_batches = self.config.watermark.buffer.size // batch_size
+        use_adaptive = bool(getattr(self.config.watermark, 'adaptive_alpha', False))
+
+        # === 创新点 #1（自适应 α）辅助函数 ===
+        #   按 prompt token 长度映射 α ∈ [α_min, α_max]
+        #   简单 prompt (token 短) → α 小 → 弱水印 → 保护图像细节
+        #   复杂 prompt (token 长) → α 大 → 强水印 → 确保可检测
+        alpha_min = float(getattr(self.config.watermark, 'adaptive_alpha_min', 0.3))
+        alpha_max = float(getattr(self.config.watermark, 'adaptive_alpha_max', 0.7))
+        alpha_scale = float(getattr(self.config.watermark, 'adaptive_alpha_scale', 25.0))
+
+        def _prompt_to_alpha(prompt_list):
+            """把 prompt list 映射成长度 B 的 α tensor"""
+            if not use_adaptive:
+                return float(self.config.watermark.grid.noise_mix_alpha)
+            lengths = torch.tensor([len(p.split()) for p in prompt_list], dtype=torch.float32)
+            # sigmoid 把 [0, +∞) 映射到 (0, 1), 然后 linear map 到 [alpha_min, alpha_max]
+            # scale 控制拐点 — 25 表示 "平均 25 token 出现 α=0.5"
+            norm = torch.sigmoid((lengths - alpha_scale) / 8.0)
+            return alpha_min + (alpha_max - alpha_min) * norm
 
         for batch_idx in tqdm(range(num_batches)):
-            # Generate watermarked noise using the watermark module
-            alpha = self.config.watermark.grid.noise_mix_alpha
-            watermark_noise = self.watermark(batch_size, alpha=alpha).half()
+            # === 创新点 #1 关键修改 ===
+            # 自适应 α 模式下, 我们需要先知道本 batch 用哪几个 prompt 才能算 α tensor
+            # generate_full 默认会随机挑 prompt — 我们用 ret_prompts=True 拿到它们
+            if use_adaptive:
+                # 先用一个 dummy noise 跑一次只是为了拿到 prompts
+                # 但更省事的做法: 直接手动 random sample prompts
+                batch_prompts = [self.prompts[random.randint(0, len(self.prompts) - 1)] for _ in range(batch_size)]
+                alpha_tensor = _prompt_to_alpha(batch_prompts).to(self.watermark.grid.device)
+                watermark_noise = self.watermark(batch_size, alpha=alpha_tensor).half()
+            else:
+                alpha = self.config.watermark.grid.noise_mix_alpha
+                watermark_noise = self.watermark(batch_size, alpha=alpha).half()
+                batch_prompts = None
 
             # Generate watermarked images using diffusion model
-            watermarked_images = self.diffusion_model.generate_full(
-                batch_size=batch_size,
-                noise=watermark_noise,
-                x_ts_ret=False,
-                prompts=self.prompts
-            ).float()
+            if use_adaptive and batch_prompts is not None:
+                # 显式传 positive_prompts, 让 SD 用我们选好的 prompts
+                watermarked_images = self.diffusion_model.generate_full(
+                    batch_size=batch_size,
+                    noise=watermark_noise,
+                    x_ts_ret=False,
+                    prompts=None,
+                    positive_prompts=batch_prompts,
+                    negative_prompts=[''] * batch_size,
+                ).float()
+            else:
+                watermarked_images = self.diffusion_model.generate_full(
+                    batch_size=batch_size,
+                    noise=watermark_noise,
+                    x_ts_ret=False,
+                    prompts=self.prompts
+                ).float()
 
             if self.detector_type == 'pixel':
                 # Pixel detector: cache decoded images (3 x 512 x 512) directly.
@@ -489,12 +536,14 @@ class Trainer:
             # ----------------------------------------------------------------
             loss_alpha = logits_all.new_tensor(0.0)
             if getattr(self.config.training, 'use_alpha_reg', True):
-                w_alpha = getattr(self.config.training, 'alpha_reg_weight', 1e-4)
-                alpha = self.config.watermark.grid.noise_mix_alpha
-                # 软限制 α ∈ [0.3, 0.7]（alpha 是 Python float,需转 tensor）
-                alpha_t = logits_all.new_tensor(float(alpha))
-                loss_alpha = w_alpha * (
-                    F.relu(0.3 - alpha_t) + F.relu(alpha_t - 0.7)
+                w_alpha = float(getattr(self.config.training, 'alpha_reg_weight', 1e-4))
+                alpha_val = float(self.config.watermark.grid.noise_mix_alpha)
+                alpha_t = torch.tensor(alpha_val, dtype=logits_all.dtype, device=logits_all.device)
+                alpha_lo = torch.tensor(0.3, dtype=logits_all.dtype, device=logits_all.device)
+                alpha_hi = torch.tensor(0.7, dtype=logits_all.dtype, device=logits_all.device)
+                w_alpha_t = torch.tensor(w_alpha, dtype=logits_all.dtype, device=logits_all.device)
+                loss_alpha = w_alpha_t * (
+                    F.relu(alpha_lo - alpha_t) + F.relu(alpha_t - alpha_hi)
                 )
 
             # ----------------------------------------------------------------
@@ -508,7 +557,7 @@ class Trainer:
             td_error_w = (0.5 - p_aug_images_watermarked).abs().mean().item()
             td_error_c = (p_aug_images - 0.5).abs().mean().item()
             td_error = max(td_error_w, td_error_c)
-            self.aug_sampler.update(aug_idx, td_error > 0.1)
+            self.aug_sampler.update(aug_idx, td_error)
 
             # === TOTAL LOSS ===
             loss = loss_cls + loss_cons + loss_margin + loss_alpha

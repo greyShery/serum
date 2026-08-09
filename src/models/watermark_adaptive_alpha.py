@@ -86,20 +86,7 @@ class Watermark(nn.Module):
         normalized_grid = (scaled_grid - scaled_grid.mean()) / (scaled_grid.std() + 1e-6)
 
         # Combine original noise with normalized grid pattern (equal weighting)
-        # 创新点 #1（自适应 α）：支持 scalar 或 1-D tensor (B,)
-        if isinstance(alpha, torch.Tensor):
-            # 0-dim tensor (size 1) → 当 scalar 处理, 广播到所有 sample
-            if alpha.dim() == 0 or (alpha.dim() == 1 and alpha.shape[0] == 1):
-                noise = orig_noise * ((1 - alpha) ** 0.5) + normalized_grid * (alpha ** 0.5)
-            else:
-                if alpha.shape[0] != batch_size:
-                    raise ValueError(
-                        f"per-sample alpha must have length B={batch_size}, got {tuple(alpha.shape)}"
-                    )
-                alpha_b = alpha.view(batch_size, 1, 1, 1).to(self.grid.device, dtype=orig_noise.dtype)
-                noise = orig_noise * ((1 - alpha_b) ** 0.5) + normalized_grid * (alpha_b ** 0.5)
-        else:
-            noise = orig_noise * ((1 - alpha) ** 0.5) + normalized_grid * (alpha ** 0.5)
+        noise = orig_noise * ((1 - alpha) ** 0.5) + normalized_grid * (alpha ** 0.5)
 
         if ret_noise:
             return noise, orig_noise

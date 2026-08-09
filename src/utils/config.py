@@ -54,7 +54,10 @@ class Config:
 
         # Watermark
         wm = cfg["watermark"]
+        # 透传所有 yaml 顶层字段 (包括创新点 #1 的 adaptive_alpha*)
+        # 但 grid/buffer 子字典保留嵌套结构
         self.watermark = self._ns({
+            **{k: v for k, v in wm.items() if k not in ("grid", "buffer")},
             "grid": self._ns(wm["grid"]),
             "buffer": self._ns(wm["buffer"]),
             "model_dir": wm["model_dir"],
