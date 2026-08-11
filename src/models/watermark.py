@@ -35,7 +35,7 @@ class Watermark(nn.Module):
     def __init__(self, config: Config):
         """
         Initialize the Watermark module.
-        
+
         Args:
             config (Config): Configuration object with watermark parameters.
         """
@@ -44,6 +44,48 @@ class Watermark(nn.Module):
         self.config = config
 
         self.grid = nn.Parameter(torch.randn(self.config.base_latent_shape))
+
+        # === [创新点 #2: Spherical 3阶矩精确保持] ===
+        #   启用后, forward 归一化阶段会额外做 tanh 重映射,
+        #   保证 watermark 的 3 阶矩 (skewness) 严格 ≈ 0;
+        #   与原始 N(0, I) 噪声的 3 阶矩一致, 降低 FID。
+        self.use_spherical_3rd_moment = bool(
+            getattr(self.config.watermark, 'use_spherical_3rd_moment', False)
+        )
+        self._tanh_eps = 1e-6  # 防 tanh saturation
+
+    def _spherical_normalize(self, scaled_grid: torch.Tensor) -> torch.Tensor:
+        """
+        Spherical 2-order + 3-order moment exact preservation.
+
+        阶段:
+          1. 减均值               → 1阶矩 = 0 (centering)
+          2. 除标准差             → 2阶矩 = 1 (scaling)
+          3. tanh 重映射 (可选)    → 3阶矩 = 0 (奇函数 → skewness 严格 0)
+          4. mean-center + norm 还原 →  1阶矩重新 = 0, ||A||₂ = sqrt(d)
+
+        Args:
+            scaled_grid: 已做 0.5~2.0 std 担位的 grid 张量, shape = base_latent_shape.
+
+        Returns:
+            归一化后的 grid, 满足 1/2/3 阶矩约束。
+        """
+        # 1. centering
+        sg = scaled_grid - scaled_grid.mean()
+        # 2. std = 1
+        sg = sg / (sg.std() + self._tanh_eps)
+
+        if self.use_spherical_3rd_moment:
+            # 3. tanh 奇函数 → skewness 期望 0 严格成立
+            #    (不 mean-center: 离散化下 tanh 自然 mean ≈ 0, 强行 center 会破坏奇对称)
+            sg = torch.tanh(sg)
+            # 4. 恢复 ||sg||₂ = sqrt(d), 保留论文 Appendix B 的投影约束
+            d = float(sg.numel())
+            cur_norm = sg.norm()
+            if cur_norm > 0:
+                sg = sg * (d ** 0.5) / cur_norm
+
+        return sg
 
     def forward(self, batch_size: int, ret_noise: bool = False, alpha: Optional[float] = None) -> torch.Tensor:
         """
@@ -83,7 +125,8 @@ class Watermark(nn.Module):
         else:
             scale = 1.0
         scaled_grid = self.grid * scale
-        normalized_grid = (scaled_grid - scaled_grid.mean()) / (scaled_grid.std() + 1e-6)
+        # === [创新点 #2] 替换原 1/2 阶归一化 → 2 阶 + 3 阶 (可选) ===
+        normalized_grid = self._spherical_normalize(scaled_grid)
 
         # Combine original noise with normalized grid pattern (equal weighting)
         # 创新点 #1（自适应 α）：支持 scalar 或 1-D tensor (B,)

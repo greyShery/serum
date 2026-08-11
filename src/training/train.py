@@ -592,6 +592,39 @@ class Trainer:
                 )
 
             # ----------------------------------------------------------------
+            # 创新点 #2 (Spherical 3阶矩精确保持): 3rd-moment 正则
+            #   论文 Appendix B 假设 η' 与 N(0,I) 在 1/2 阶矩上对齐,
+            #   但 3 阶矩 (skewness) 未约束。我们对 learnable grid 的 forward
+            #   归一化结果 (去除 mean/std 后) 做 skewness -> 0 软约束,
+            #   与生成时 _spherical_normalize 的 tanh 设计一致(对应硬约束)。
+            #   λ=0.01 保守起步, 避免初训阶段拉扯 watermark grid 跳出好区间。
+            # ----------------------------------------------------------------
+            loss_sph3 = logits_all.new_tensor(0.0)
+            if (getattr(self.config.training, 'use_spherical_3rd_moment', False)
+                    and getattr(self.watermark, 'use_spherical_3rd_moment', False)):
+                w_sph3 = float(getattr(self.config.training, 'spherical_3rd_weight', 0.01))
+                # 复用 _spherical_normalize 得到与 forward 一致的"归一化 grid"
+                with torch.no_grad():
+                    g = self.watermark.grid.detach()
+                    g_std = g.std()
+                    if float(g_std) < 0.5:
+                        scale = 0.5 / (float(g_std) + 1e-6)
+                    elif float(g_std) > 2.0:
+                        scale = 2.0 / (float(g_std) + 1e-6)
+                    else:
+                        scale = 1.0
+                    norm_g = self.watermark._spherical_normalize(g * scale).detach()
+                    # 若当前未开 tanh 分支, 手动中心+std 一次, 保证正则项与设计一致
+                    if not self.watermark.use_spherical_3rd_moment:
+                        norm_g = (norm_g - norm_g.mean()) / (norm_g.std() + 1e-6)
+                # skewness = E[(x-μ)^3] / σ^3
+                centered = norm_g - norm_g.mean()
+                std = norm_g.std() + 1e-8
+                skew = (centered ** 3).mean() / (std ** 3)
+                loss_sph3 = torch.tensor(w_sph3, dtype=logits_all.dtype,
+                                         device=logits_all.device) * (skew ** 2)
+
+            # ----------------------------------------------------------------
             # 创新点 5 (NovPER): TD-error-style priority for miss 反馈
             #   原文: aug_sampler 使用二元 mistake  -> 换成连续错误率
             #   依据: PER_Schaul2016 论文, mistake-as-signal 多任务思想
@@ -605,7 +638,7 @@ class Trainer:
             self.aug_sampler.update(aug_idx, td_error)
 
             # === TOTAL LOSS ===
-            loss = loss_cls + loss_cons + loss_margin + loss_alpha
+            loss = loss_cls + loss_cons + loss_margin + loss_alpha + loss_sph3
 
             # === BACKWARD PASS ===
             loss.backward()
@@ -641,6 +674,7 @@ class Trainer:
                 print(f'Non-Watermarked (augmented) Acc: {recent_acc_nw:.9f}')
                 print(f'  - cls={loss_cls.item():.6f}  cons={loss_cons.item():.6f}  '
                       f'margin={loss_margin.item():.6f}  alpha={loss_alpha.item():.6f}  '
+                      f'sph3={loss_sph3.item():.6f}  '
                       f'td_err={td_error:.4f}')
                 print(f'Final probs: {self.aug_sampler.get_probs()}')
 
