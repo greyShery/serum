@@ -967,7 +967,11 @@ class Trainer:
         checkpoint = torch.load(checkpoint_path, map_location=device)
 
         # Initialize models
-        score_model = WatermarkScoreModel(config).to(device)
+        detector_type = getattr(config.training, 'detector_type', 'latent').lower()
+        if detector_type == 'pixel':
+            score_model = PixelWatermarkScoreModel(config).to(device)
+        else:
+            score_model = WatermarkScoreModel(config).to(device)
         watermark = Watermark(config).to(device)
 
         score_model.load_state_dict(checkpoint['score_model_state_dict'])
@@ -1013,8 +1017,14 @@ def main() -> None:
     diffusion_model = ModelWrapper(DiffusionModel(config).to(device)).to(device)
     watermark = Watermark(config).to(device)
 
-    # Initialize watermark scoring model
-    score_model = WatermarkScoreModel(config).to(device)
+    # Initialize watermark scoring model (Innovation #3: pixel detector)
+    detector_type = getattr(config.training, 'detector_type', 'latent').lower()
+    if detector_type == 'pixel':
+        score_model = PixelWatermarkScoreModel(config).to(device)
+        print(f"[PixelDetector] Using PixelWatermarkScoreModel (3x512x512 input)")
+    else:
+        score_model = WatermarkScoreModel(config).to(device)
+        print(f"[LatentDetector] Using WatermarkScoreModel (4x64x64 input)")
 
     print("Watermark Score Model:")
     print(f"Total parameters: {sum(p.numel() for p in score_model.parameters()):,}")
